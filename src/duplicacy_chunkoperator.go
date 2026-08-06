@@ -522,10 +522,7 @@ func (operator *ChunkOperator) UploadChunk(threadIndex int, task ChunkTask) bool
 	chunkID := task.chunkID
 	chunkSize := chunk.GetLength()
 
-	// For a snapshot chunk, verify that its chunk id is correct
-	if task.isMetadata {
-		chunk.VerifyID()
-	}
+	// The data in the buffer is checked against the chunk id by Encrypt() below
 
 	if task.isMetadata && operator.snapshotCache != nil && operator.storage.IsCacheNeeded() {
 		// Save a copy to the local snapshot.

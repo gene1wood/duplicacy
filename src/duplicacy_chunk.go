@@ -66,6 +66,10 @@ type Chunk struct {
 	// it isn't necessary to compute the hash, for instance, when the encrypted data is being
 	// read into the primary buffer
 
+	checksum hash.Hash64 // Keeps track of a fast non-cryptographic hash of the data stored in the buffer, so
+	// that the buffer can be checked for in-memory corruption before the chunk is
+	// uploaded.  It is nil whenever hasher is nil, or when there is no buffer to check
+
 	hash []byte // The hash of the chunk data.  It is always in the binary format
 	id   string // The id of the chunk data (used as the file name for saving the chunk); always in hex format
 
@@ -85,6 +89,19 @@ var ENCRYPTION_BANNER = "duplicacy\000"
 var ENCRYPTION_VERSION_RSA byte = 2
 
 var ERASURE_CODING_BANNER = "duplicacy\003"
+
+// The chunk checksum only serves to detect in-memory corruption of the chunk buffer.  It never leaves the
+// process, so the key doesn't need to be secret.
+var chunkChecksumKey = make([]byte, 32)
+
+func newChunkChecksum() hash.Hash64 {
+	checksum, err := highwayhash.New64(chunkChecksumKey)
+	if err != nil {
+		LOG_ERROR("CHUNK_CHECKSUM", "Failed to create the chunk checksum: %v", err)
+		return nil
+	}
+	return checksum
+}
 
 // CreateChunk creates a new chunk.
 func CreateChunk(config *Config, bufferNeeded bool) *Chunk {
@@ -131,6 +148,12 @@ func (chunk *Chunk) Reset(hashNeeded bool) {
 	} else {
 		chunk.hasher = nil
 	}
+	// A hash-only chunk has no buffer that can be corrupted, so it doesn't need a checksum
+	if hashNeeded && chunk.buffer != nil {
+		chunk.checksum = newChunkChecksum()
+	} else {
+		chunk.checksum = nil
+	}
 	chunk.hash = nil
 	chunk.id = ""
 	chunk.size = 0
@@ -151,6 +174,9 @@ func (chunk *Chunk) Write(p []byte) (int, error) {
 	// hasher may be nil, when the chunk is used to stored encrypted content
 	if chunk.hasher != nil {
 		chunk.hasher.Write(p)
+	}
+	if chunk.checksum != nil {
+		chunk.checksum.Write(p)
 	}
 	return len(p), nil
 }
@@ -179,21 +205,37 @@ func (chunk *Chunk) GetID() string {
 	return chunk.id
 }
 
-func (chunk *Chunk) VerifyID() {
+// VerifyChecksum recomputes the checksum of the data in the buffer and compares it against the checksum that
+// was computed incrementally as the data was written in.  A mismatch means the buffer was corrupted in memory
+// after the data had been hashed, in which case the chunk no longer matches the id under which it is about to
+// be stored and must not be uploaded.
+func (chunk *Chunk) VerifyChecksum() {
+	if chunk.checksum == nil {
+		return
+	}
+
+	checksum := newChunkChecksum()
+	checksum.Write(chunk.buffer.Bytes())
+	if checksum.Sum64() == chunk.checksum.Sum64() {
+		return
+	}
+
+	// The backup is about to be aborted so it costs nothing to recompute the real chunk id for the error message
 	hasher := chunk.config.NewKeyedHasher(chunk.config.HashKey)
 	hasher.Write(chunk.buffer.Bytes())
-	hash := hasher.Sum(nil)
-	hasher = chunk.config.NewKeyedHasher(chunk.config.IDKey)
-	hasher.Write([]byte(hash))
-	chunkID := hex.EncodeToString(hasher.Sum(nil))
-	if chunkID != chunk.GetID() {
-		LOG_ERROR("CHUNK_ID", "The chunk id should be %s instead of %s, length: %d", chunkID, chunk.GetID(), len(chunk.buffer.Bytes()))
-	}
+	idHasher := chunk.config.NewKeyedHasher(chunk.config.IDKey)
+	idHasher.Write(hasher.Sum(nil))
+	LOG_ERROR("CHUNK_ID", "The chunk id should be %s instead of %s, length: %d",
+		hex.EncodeToString(idHasher.Sum(nil)), chunk.GetID(), chunk.GetLength())
 }
 
 // Encrypt encrypts the plain data stored in the chunk buffer.  If derivationKey is not nil, the actual
 // encryption key will be HMAC-SHA256(encryptionKey, derivationKey).
 func (chunk *Chunk) Encrypt(encryptionKey []byte, derivationKey string, isMetadata bool) (err error) {
+
+	// Every chunk that is stored is encrypted first, so this is the one place where the data can be checked
+	// against the id it is about to be stored under, no matter which code path is uploading it
+	chunk.VerifyChecksum()
 
 	var aesBlock cipher.Block
 	var gcm cipher.AEAD
@@ -204,6 +246,8 @@ func (chunk *Chunk) Encrypt(encryptionKey []byte, derivationKey string, isMetada
 	encryptedBuffer.Reset()
 	defer func() {
 		ReleaseChunkBuffer(encryptedBuffer)
+		// The buffer now holds the encrypted data, which the checksum no longer describes
+		chunk.checksum = nil
 	}()
 
 	if len(encryptionKey) > 0 {

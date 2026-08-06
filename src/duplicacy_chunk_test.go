@@ -51,6 +51,163 @@ func TestErasureCoding(t *testing.T) {
 	return
 }
 
+// verifyChunk calls VerifyChecksum and reports whether it rejected the chunk, which is signaled by LOG_ERROR
+// raising an Exception.
+func verifyChunk(chunk *Chunk) (rejected bool) {
+	// A previous test may have left testingT set, which would turn the expected error into a test failure
+	savedTestingT := testingT
+	testingT = nil
+
+	defer func() {
+		testingT = savedTestingT
+		if r := recover(); r != nil {
+			if exception, ok := r.(Exception); ok && exception.LogID == "CHUNK_ID" {
+				rejected = true
+				return
+			}
+			panic(r)
+		}
+	}()
+
+	chunk.VerifyChecksum()
+	return false
+}
+
+// encryptChunk calls Encrypt and reports whether the checksum verification it performs rejected the chunk
+func encryptChunk(chunk *Chunk, key []byte) (rejected bool, err error) {
+	savedTestingT := testingT
+	testingT = nil
+
+	defer func() {
+		testingT = savedTestingT
+		if r := recover(); r != nil {
+			if exception, ok := r.(Exception); ok && exception.LogID == "CHUNK_ID" {
+				rejected = true
+				return
+			}
+			panic(r)
+		}
+	}()
+
+	err = chunk.Encrypt(key, "", false)
+	return false, err
+}
+
+func TestChunkChecksum(t *testing.T) {
+
+	key := []byte("duplicacydefault")
+
+	config := CreateConfig()
+	config.HashKey = key
+	config.IDKey = key
+	config.MinimumChunkSize = 100
+	config.CompressionLevel = DEFAULT_COMPRESSION_LEVEL
+
+	plainData := make([]byte, 100000)
+	crypto_rand.Read(plainData)
+
+	// An intact chunk must pass
+	chunk := CreateChunk(config, true)
+	chunk.Reset(true)
+	chunk.Write(plainData)
+	chunk.GetID()
+	if verifyChunk(chunk) {
+		t.Errorf("An intact chunk was rejected")
+	}
+
+	// Every single bit flipped in the buffer after the chunk was hashed must be caught
+	for _, offset := range []int{0, len(plainData) / 2, len(plainData) - 1} {
+		chunk = CreateChunk(config, true)
+		chunk.Reset(true)
+		chunk.Write(plainData)
+		chunk.GetID()
+		chunk.GetBytes()[offset] ^= 1
+		if !verifyChunk(chunk) {
+			t.Errorf("A chunk corrupted at offset %d was not rejected", offset)
+		}
+	}
+
+	// Data written in multiple calls must be checksummed the same as data written in one call
+	chunk = CreateChunk(config, true)
+	chunk.Reset(true)
+	for i := 0; i < len(plainData); i += 7777 {
+		end := i + 7777
+		if end > len(plainData) {
+			end = len(plainData)
+		}
+		chunk.Write(plainData[i:end])
+	}
+	chunk.GetID()
+	if verifyChunk(chunk) {
+		t.Errorf("A chunk written in multiple calls was rejected")
+	}
+
+	// A chunk with no hash, such as a snapshot file or the config file, has nothing to verify against
+	chunk = CreateChunk(config, true)
+	chunk.Reset(false)
+	chunk.Write(plainData)
+	chunk.GetBytes()[0] ^= 1
+	if verifyChunk(chunk) {
+		t.Errorf("A chunk with no hash was verified")
+	}
+
+	// A hash-only chunk has no buffer to verify
+	chunk = CreateChunk(config, false)
+	chunk.Reset(true)
+	chunk.Write(plainData)
+	if verifyChunk(chunk) {
+		t.Errorf("A hash-only chunk was verified")
+	}
+
+	// Encrypt verifies the chunk itself, which is what covers every path that stores a chunk
+	for _, compressionLevel := range []int{DEFAULT_COMPRESSION_LEVEL, 3, ZSTD_COMPRESSION_LEVEL_DEFAULT} {
+		config.CompressionLevel = compressionLevel
+
+		chunk = CreateChunk(config, true)
+		chunk.Reset(true)
+		chunk.Write(plainData)
+		chunk.GetID()
+		if rejected, err := encryptChunk(chunk, key); err != nil {
+			t.Errorf("[%d] Failed to encrypt the data: %v", compressionLevel, err)
+		} else if rejected {
+			t.Errorf("[%d] Encrypt rejected an intact chunk", compressionLevel)
+		}
+
+		chunk = CreateChunk(config, true)
+		chunk.Reset(true)
+		chunk.Write(plainData)
+		chunk.GetID()
+		chunk.GetBytes()[len(plainData)/2] ^= 1
+		if rejected, err := encryptChunk(chunk, key); err != nil {
+			t.Errorf("[%d] Failed to encrypt the corrupted data: %v", compressionLevel, err)
+		} else if !rejected {
+			t.Errorf("[%d] Encrypt accepted a corrupted chunk", compressionLevel)
+		}
+
+		// A chunk with no hash, such as a snapshot file or the config file, must still encrypt
+		chunk = CreateChunk(config, true)
+		chunk.Reset(false)
+		chunk.Write(plainData)
+		if rejected, err := encryptChunk(chunk, key); err != nil {
+			t.Errorf("[%d] Failed to encrypt a chunk with no hash: %v", compressionLevel, err)
+		} else if rejected {
+			t.Errorf("[%d] Encrypt verified a chunk with no hash", compressionLevel)
+		}
+	}
+	config.CompressionLevel = DEFAULT_COMPRESSION_LEVEL
+
+	// Once the chunk has been encrypted the buffer no longer holds the data the checksum was computed from
+	chunk = CreateChunk(config, true)
+	chunk.Reset(true)
+	chunk.Write(plainData)
+	chunk.GetID()
+	if err := chunk.Encrypt(key, "", false); err != nil {
+		t.Errorf("Failed to encrypt the data: %v", err)
+	} else if verifyChunk(chunk) {
+		t.Errorf("An encrypted chunk was verified against the checksum of its plain data")
+	}
+}
+
 func TestChunkBasic(t *testing.T) {
 
 	key := []byte("duplicacydefault")
